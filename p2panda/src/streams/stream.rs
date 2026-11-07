@@ -111,6 +111,11 @@ where
         .await
         .map_err(|err| CreateStreamError(err.to_string()))?;
 
+    // Keep around the sync handle on both the publisher and subscriber ends to keep it running
+    // even if one half got dropped. The processing task uses it too, to push imported operations
+    // to live sync sessions.
+    let sync_handle = Arc::new(sync_handle);
+
     // Channel to send processed events to the application-layer.
     let (app_tx, app_rx) = mpsc::channel::<StreamEvent<M>>(BUFFER_SIZE);
 
@@ -141,6 +146,7 @@ where
         let pipeline = pipeline.clone();
         let acked = acked.clone();
         let store = store.clone();
+        let live_handle = sync_handle.clone();
 
         tokio::spawn(async move {
             // =======================
@@ -273,6 +279,7 @@ where
                         match event {
                             ExternalStreamEvent::Start { session_id } => StreamEvent::ImportStarted { session_id },
                             ExternalStreamEvent::Operation { session_id, operation } => {
+                                let imported = (*operation).clone();
                                 let Some(event) = process_operation::<M>(
                                     *operation,
                                     topic,
@@ -283,6 +290,18 @@ where
                                 ).await else {
                                     continue;
                                 };
+
+                                // Like locally published operations, push imported ones to nodes
+                                // we have a live sync session with. Otherwise they only learn about
+                                // them when they next run the sync protocol with us.
+                                if matches!(event, StreamEvent::Processed { .. })
+                                    && let Err(err) = live_handle.publish(imported)
+                                {
+                                    warn!(
+                                        topic = %topic.fmt_short(),
+                                        "failed pushing imported operation to live sessions: {err}"
+                                    );
+                                }
 
                                 event
                             },
@@ -299,10 +318,6 @@ where
             }
         });
     }
-
-    // Keep around the sync handle on both the publisher and subscriber ends to keep it running
-    // even if one half got dropped.
-    let sync_handle = Arc::new(sync_handle);
 
     let tx = StreamPublisher {
         topic,
